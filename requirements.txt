@@ -1,0 +1,7 @@
+streamlit
+pandas
+sqlalchemy
+bcrypt
+cryptography
+pyotp
+python-dotenv
