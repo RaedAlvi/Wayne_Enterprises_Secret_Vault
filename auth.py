@@ -1,110 +1,230 @@
-# auth.py
+"""
+Authentication module with password policy, 2FA, and account lockout
+"""
 import streamlit as st
-from db import fetch_user_by_email, create_user, set_failed_login, insert_audit
-from security import password_policy_ok, hash_password, verify_password, new_totp_secret, verify_totp, totp_now, lockout_until_after
-from utils import safe_ex
-
-def _init_session():
-    for k, v in {
-        "user": None,
-        "last_active": None,
-        "needs_2fa": False
-    }.items():
-        if k not in st.session_state: st.session_state[k] = v
+from datetime import datetime, timedelta
+import time
+from security import (
+    password_policy_ok, 
+    hash_password, 
+    verify_password, 
+    new_totp_secret, 
+    verify_totp, 
+    totp_qr_code
+)
+from db import (
+    user_exists, 
+    create_user, 
+    get_user, 
+    update_failed_attempts, 
+    reset_failed_attempts,
+    is_account_locked,
+    log_audit
+)
+from utils import safe_exec
 
 def register_form():
-    st.subheader("Create Account")
-    email = st.text_input("Email")
-    pw = st.text_input("Password", type="password")
-    cpw = st.text_input("Confirm Password", type="password")
-    want_2fa = st.checkbox("Enable 2FA (TOTP)?", value=True)
-
-    if st.button("Register"):
-        ok, msg = password_policy_ok(pw)
-        if not ok:
-            st.error(f"Password too weak: {msg}")
-            return
-        if pw != cpw:
-            st.error("Passwords do not match.")
-            return
-        row = fetch_user_by_email(email)
-        if row:
-            st.error("Email already registered.")
-            return
-        secret = new_totp_secret() if want_2fa else None
-        hashed = hash_password(pw)
-        _, err = safe_ex(create_user, email, hashed, "user", secret)
-        if err:
-            st.error(err)
-            return
-        insert_audit(None, "register", email)
-        st.success("Account created.")
-        if secret:
-            st.info("2FA enabled. Use an authenticator app to add this secret:")
-            st.code(secret)
-            st.caption(f"Current code (demo): {totp_now(secret)}")
+    """User registration with strong password policy"""
+    st.markdown("### 🔐 Create Secure Account")
+    st.markdown("""
+        <div class="security-info">
+            <h4>🛡️ Security Requirements:</h4>
+            <ul>
+                <li>✓ Minimum 8 characters</li>
+                <li>✓ At least one uppercase letter</li>
+                <li>✓ At least one lowercase letter</li>
+                <li>✓ At least one number</li>
+                <li>✓ At least one special character (!@#$%^&*)</li>
+            </ul>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    with st.form("register_form"):
+        email = st.text_input("Email", placeholder="bruce.wayne@wayneenterprises.com")
+        password = st.text_input("Password", type="password", 
+                                placeholder="Create a strong password")
+        password_confirm = st.text_input("Confirm Password", type="password",
+                                        placeholder="Re-enter your password")
+        
+        role = st.selectbox("Role", ["user", "admin"], 
+                           help="Admin role grants access to all audit logs")
+        
+        submitted = st.form_submit_button("🦇 Register Account", use_container_width=True)
+        
+        if submitted:
+            # Validation
+            if not email or '@' not in email:
+                st.error("❌ Please enter a valid email address")
+                return
+            
+            if password != password_confirm:
+                st.error("❌ Passwords do not match")
+                return
+            
+            # Check password policy
+            policy_ok, message = password_policy_ok(password)
+            if not policy_ok:
+                st.error(f"❌ {message}")
+                return
+            
+            # Check if user exists
+            if user_exists(email):
+                st.error("❌ Email already registered")
+                return
+            
+            # Generate TOTP secret
+            totp_secret = new_totp_secret()
+            
+            # Hash password
+            password_hash = hash_password(password)
+            
+            # Create user
+            success = create_user(email, password_hash, totp_secret, role)
+            
+            if success:
+                log_audit(email, "User registered", "0.0.0.0")
+                
+                st.success("✅ Account created successfully!")
+                st.info("📱 Please save your 2FA secret key for authentication")
+                
+                # Display TOTP QR code
+                st.markdown("### 📲 Set Up Two-Factor Authentication")
+                st.markdown("""
+                    Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.)
+                """)
+                
+                qr_img = totp_qr_code(totp_secret, email)
+                st.image(qr_img, width=300)
+                
+                st.code(totp_secret, language=None)
+                st.warning("⚠️ Save this secret key securely. You'll need it to login.")
+                
+                time.sleep(20)
+                st.rerun()
+            else:
+                st.error("❌ Registration failed. Please try again.")
 
 def login_form():
-    st.subheader("Login")
-    email = st.text_input("Email", key="login_email")
-    pw = st.text_input("Password", type="password", key="login_pw")
-
-    if st.button("Login"):
-        row = fetch_user_by_email(email)
-        if not row:
-            st.error("Invalid credentials.")
-            return
-        uid, uemail, pwhash, role, totp_secret, failed, lockout_until = row
-        if lockout_until:
-            st.error("Account locked. Try later.")
-            return
-
-        if not verify_password(pw, pwhash):
-            failed = (failed or 0) + 1
-            until = lockout_until_after(failed)
-            set_failed_login(email, failed, until)
-            insert_audit(uid, "login_fail", f"failed={failed}")
-            st.error("Invalid credentials.")
-            return
-
-        set_failed_login(email, 0, None)
-
-        if totp_secret:
-            st.session_state["needs_2fa"] = True
-            st.session_state["user"] = {"id": uid, "email": uemail, "role": role, "totp": totp_secret}
-            st.info("Enter your 2FA code to finish login.")
-        else:
-            st.session_state["user"] = {"id": uid, "email": uemail, "role": role, "totp": None}
-            st.session_state["last_active"] = datetime.utcnow().timestamp()
-            insert_audit(uid, "login_success", None)
-            st.success("Logged in.")
+    """Login form with account lockout protection"""
+    st.markdown("### 🔐 Secure Login")
+    
+    with st.form("login_form"):
+        email = st.text_input("Email", placeholder="bruce.wayne@wayneenterprises.com")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
+        
+        submitted = st.form_submit_button("🔓 Login", use_container_width=True)
+        
+        if submitted:
+            if not email or not password:
+                st.error("❌ Please enter both email and password")
+                return
+            
+            # Check if account is locked
+            if is_account_locked(email):
+                st.error("🔒 Account locked due to multiple failed login attempts. Please try again in 15 minutes.")
+                log_audit(email, "Login attempt - account locked", "0.0.0.0")
+                return
+            
+            # Get user
+            user = get_user(email)
+            
+            if not user:
+                log_audit(email, "Login failed - user not found", "0.0.0.0")
+                st.error("❌ Invalid credentials")
+                return
+            
+            user_id, stored_email, password_hash, totp_secret, failed_attempts, lockout_until, role = user
+            
+            # Verify password
+            if not verify_password(password, password_hash):
+                # Increment failed attempts
+                new_attempts = failed_attempts + 1
+                update_failed_attempts(email, new_attempts)
+                
+                remaining = 5 - new_attempts
+                if remaining > 0:
+                    st.error(f"❌ Invalid credentials. {remaining} attempts remaining.")
+                else:
+                    st.error("🔒 Account locked for 15 minutes due to too many failed attempts.")
+                
+                log_audit(email, f"Login failed - incorrect password (attempt {new_attempts})", "0.0.0.0")
+                return
+            
+            # Reset failed attempts on successful password verification
+            reset_failed_attempts(email)
+            
+            # Set session state
+            st.session_state.authenticated = True
+            st.session_state.user_email = email
+            st.session_state.totp_secret = totp_secret
+            st.session_state.user_role = role
+            st.session_state.last_activity = datetime.now()
+            
+            log_audit(email, "Password verified - awaiting 2FA", "0.0.0.0")
+            
+            st.success("✅ Password verified! Please enter your 2FA code.")
+            time.sleep(1)
+            st.rerun()
 
 def totp_step():
-    if not st.session_state.get("needs_2fa"): return
-    st.subheader("Two-Factor Authentication")
-    code = st.text_input("Enter 6-digit code", max_chars=6)
-    if st.button("Verify 2FA"):
-        secret = st.session_state["user"]["totp"]
-        if verify_totp(secret, code):
-            st.session_state["needs_2fa"] = False
-            st.session_state["last_active"] = datetime.utcnow().timestamp()
-            insert_audit(st.session_state["user"]["id"], "2fa_success", None)
-            st.success("2FA verified.")
-        else:
-            insert_audit(st.session_state["user"]["id"], "2fa_fail", None)
-            st.error("Invalid code.")
+    """Two-factor authentication step"""
+    st.markdown("### 🔐 Two-Factor Authentication")
+    st.info(f"📧 Logged in as: **{st.session_state.user_email}**")
+    
+    st.markdown("""
+        <div class="security-info">
+            <p>🛡️ Enter the 6-digit code from your authenticator app</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    with st.form("totp_form"):
+        totp_code = st.text_input("6-Digit Code", max_chars=6, placeholder="000000")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("✅ Verify", use_container_width=True)
+        with col2:
+            cancel = st.form_submit_button("❌ Cancel", use_container_width=True)
+        
+        if cancel:
+            st.session_state.authenticated = False
+            st.session_state.user_email = None
+            st.session_state.totp_secret = None
+            st.rerun()
+        
+        if submitted:
+            if not totp_code or len(totp_code) != 6:
+                st.error("❌ Please enter a 6-digit code")
+                return
+            
+            if verify_totp(st.session_state.totp_secret, totp_code):
+                st.session_state.totp_verified = True
+                log_audit(st.session_state.user_email, "2FA verified - login successful", "0.0.0.0")
+                st.success("✅ Authentication successful!")
+                st.balloons()
+                time.sleep(1)
+                st.rerun()
+            else:
+                log_audit(st.session_state.user_email, "2FA verification failed", "0.0.0.0")
+                st.error("❌ Invalid 2FA code. Please try again.")
 
 def logout_button():
-    if st.session_state.get("user"):
-        if st.button("Logout"):
-            insert_audit(st.session_state["user"]["id"], "logout", None)
-            for k in ["user", "last_active", "needs_2fa"]:
-                st.session_state[k] = None
-            st.success("Logged out.")
+    """Logout button"""
+    if st.button("🚪 Logout", use_container_width=True, type="primary"):
+        email = st.session_state.user_email
+        log_audit(email, "User logged out", "0.0.0.0")
+        
+        st.session_state.authenticated = False
+        st.session_state.totp_verified = False
+        st.session_state.user_email = None
+        st.session_state.totp_secret = None
+        st.session_state.user_role = 'user'
+        st.success("✅ Logged out successfully")
+        time.sleep(1)
+        st.rerun()
 
 def require_auth():
-    _init_session()
-    if not st.session_state.get("user") or st.session_state.get("needs_2fa"):
-        st.warning("Please log in.")
-        return False
-    return True
+    """Decorator to require authentication"""
+    if not st.session_state.authenticated or not st.session_state.totp_verified:
+        st.error("❌ Unauthorized access. Please login.")
+        st.stop()
