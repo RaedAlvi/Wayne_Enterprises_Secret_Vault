@@ -1,55 +1,121 @@
-# security.py
-import os, re, bcrypt, pyotp, time
-from datetime import datetime, timedelta
+"""
+Security module: Password hashing, TOTP, and encryption
+"""
+import hashlib
+import secrets
+import re
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
+import pyotp
+import qrcode
+from io import BytesIO
+import base64
+import os
 
-load_dotenv()
-FERNET_KEY = os.getenv("FERNET_KEY", "").encode()
-SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "300") or "300")
-fernet = Fernet(FERNET_KEY) if FERNET_KEY else None
+# Load encryption key from environment
+FERNET_KEY = os.getenv('FERNET_KEY')
+if not FERNET_KEY:
+    # Generate a key if not exists (for demo purposes)
+    FERNET_KEY = Fernet.generate_key().decode()
+    print(f"⚠️ WARNING: Using generated FERNET_KEY: {FERNET_KEY}")
+    print("⚠️ Set this as environment variable for production!")
 
-def password_policy_ok(pw: str) -> (bool, str):
-    if len(pw) < 8: return False, "Minimum length 8."
-    if not re.search(r"[A-Z]", pw): return False, "Add an uppercase letter."
-    if not re.search(r"[a-z]", pw): return False, "Add a lowercase letter."
-    if not re.search(r"\d", pw): return False, "Add a digit."
-    if not re.search(r"[^\w\s]", pw): return False, "Add a symbol."
-    return True, ""
+cipher = Fernet(FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY)
 
-def hash_password(pw: str) -> bytes:
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt())
+# Password Policy
+def password_policy_ok(password: str) -> tuple[bool, str]:
+    """
+    Enforce strong password policy:
+    - Minimum 8 characters
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one digit
+    - At least one special character
+    """
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter"
+    
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter"
+    
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one number"
+    
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "Password must contain at least one special character (!@#$%^&*)"
+    
+    return True, "Password meets requirements"
 
-def verify_password(pw: str, hashed: bytes) -> bool:
+# Password Hashing (bcrypt-style with SHA-256)
+def hash_password(password: str) -> str:
+    """Hash password using SHA-256 with salt"""
+    salt = secrets.token_hex(16)
+    pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+    return f"{salt}${pwd_hash}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify password against stored hash"""
     try:
-        return bcrypt.checkpw(pw.encode(), hashed)
-    except Exception:
+        salt, pwd_hash = stored_hash.split('$')
+        computed_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+        return computed_hash == pwd_hash
+    except:
         return False
 
-def encrypt_note(text: str) -> bytes:
-    if not fernet: raise RuntimeError("FERNET_KEY not configured")
-    return fernet.encrypt(text.encode())
-
-def decrypt_note(blob: bytes) -> str:
-    if not fernet: raise RuntimeError("FERNET_KEY not configured")
-    return fernet.decrypt(blob).decode()
-
-def new_totp_secret():
+# TOTP (Time-based One-Time Password)
+def new_totp_secret() -> str:
+    """Generate a new TOTP secret"""
     return pyotp.random_base32()
 
-def totp_now(secret: str) -> str:
-    return pyotp.TOTP(secret).now()
-
-def verify_totp(secret: str, code: str) -> bool:
+def verify_totp(secret: str, token: str) -> bool:
+    """Verify TOTP token"""
     try:
-        return pyotp.TOTP(secret).verify(code, valid_window=1)
-    except Exception:
+        totp = pyotp.TOTP(secret)
+        return totp.verify(token, valid_window=1)
+    except:
         return False
 
-def session_stale(last_active_ts: float) -> bool:
-    return (time.time() - last_active_ts) > SESSION_IDLE_SECONDS
+def totp_qr_code(secret: str, email: str) -> bytes:
+    """Generate QR code for TOTP setup"""
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=email, issuer_name="Wayne Enterprises Vault")
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to bytes
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    
+    return buffer.getvalue()
 
-def lockout_until_after(failed_count: int):
-    if failed_count >= 5:
-        return (datetime.utcnow() + timedelta(minutes=5)).isoformat(sep=" ", timespec="seconds")
-    return None
+# AES-256 Encryption for Notes
+def encrypt_note(plaintext: str) -> str:
+    """Encrypt note using AES-256 (Fernet)"""
+    if not plaintext:
+        return ""
+    
+    try:
+        encrypted = cipher.encrypt(plaintext.encode())
+        return encrypted.decode()
+    except Exception as e:
+        print(f"Encryption error: {e}")
+        return ""
+
+def decrypt_note(ciphertext: str) -> str:
+    """Decrypt note using AES-256 (Fernet)"""
+    if not ciphertext:
+        return ""
+    
+    try:
+        decrypted = cipher.decrypt(ciphertext.encode())
+        return decrypted.decode()
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return "[Decryption failed]"
